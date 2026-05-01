@@ -252,16 +252,25 @@ class PredictionViewSet(viewsets.ViewSet):
             prediction_result, confidence = self._predict(processed_image)
             
             logger.info(
-                f"Prediction successful for {image_name}: "
+                f"Prediction for {image_name}: "
                 f"{prediction_result} (confidence: {confidence:.4f})"
             )
             
-            # Return result without storing
-            if confidence < 0.3:
+            # Handle different prediction outcomes
+            if prediction_result == "uncertain":
+                error_msg = (
+                    f"Uncertain prediction for {image_name}: "
+                    f"top 2 classes too similar (difference: {confidence:.4f} < 0.1)"
+                )
+                logger.warning(error_msg)
+                return Response(
+                    {"error": error_msg, "reason": "uncertain"},
+                    status=status.HTTP_200_OK)
+            elif confidence < 0.3:
                 error_msg = f"Low confidence ({confidence:.4f}) for {image_name}: {prediction_result}"
                 logger.error(error_msg)
                 return Response(
-                    {"error": error_msg},
+                    {"error": error_msg, "reason": "low_confidence"},
                     status=status.HTTP_200_OK)
             else:
                 output_data = {
@@ -324,13 +333,19 @@ class PredictionViewSet(viewsets.ViewSet):
     # Single image prediction method that uses the CNN model to predict the class of the input image. Returns the predicted class label and confidence score. Handles exceptions and logs prediction results for debugging and monitoring purposes.
     def _predict(self, image_array):
         """
-        Make prediction using the CNN model
+        Make prediction using the CNN model with dynamic confidence threshold
+        
+        Compares top 2 predictions:
+        - If difference >= 0.1: Accept prediction with confidence score
+        - If difference < 0.1: Reject as "uncertain" (predictions too close)
         
         Args:
             image_array: preprocessed image data with batch dimension
             
         Returns:
             Tuple of (prediction_label, confidence_score)
+            - prediction_label: class name or "uncertain"
+            - confidence_score: max score (or difference for uncertain)
         """
         if self.model is None:
             if self.image_source:
@@ -355,16 +370,38 @@ class PredictionViewSet(viewsets.ViewSet):
             print(f"Raw model predictions ({self.image_source}): {raw_prediction_dict}")
             logger.debug(f"Raw model predictions ({self.image_source}): {raw_prediction_dict}")
 
-            confidence = float(np.max(predictions))
+            # Get top 2 scores for dynamic confidence threshold
+            sorted_scores = sorted(prediction_scores, reverse=True)
+            highest_score = float(sorted_scores[0])
+            second_highest_score = float(sorted_scores[1]) if len(sorted_scores) > 1 else 0.0
+            score_difference = highest_score - second_highest_score
+            
+            # Dynamic confidence threshold: if top 2 predictions are too close, mark as uncertain
+            CONFIDENCE_THRESHOLD = 0.1
+            
             predicted_class = int(np.argmax(predictions))
-
-            prediction_label = (
-                class_labels[predicted_class]
-                if predicted_class < len(class_labels)
-                else f"class_{predicted_class}"
-            )
-
-            logger.debug(f"Model prediction: class={prediction_label}, confidence={confidence:.4f}")
+            
+            # Check if prediction confidence is sufficient (difference threshold)
+            if score_difference < CONFIDENCE_THRESHOLD:
+                logger.warning(
+                    f"Prediction uncertain: top 2 scores are too close "
+                    f"(highest={highest_score:.4f}, second={second_highest_score:.4f}, "
+                    f"difference={score_difference:.4f} < {CONFIDENCE_THRESHOLD})"
+                )
+                prediction_label = "uncertain"
+                confidence = score_difference
+                logger.debug(f"Model prediction: class=uncertain, confidence_diff={confidence:.4f}")
+            else:
+                prediction_label = (
+                    class_labels[predicted_class]
+                    if predicted_class < len(class_labels)
+                    else f"class_{predicted_class}"
+                )
+                confidence = highest_score
+                logger.debug(
+                    f"Model prediction: class={prediction_label}, confidence={confidence:.4f} "
+                    f"(difference from 2nd place: {score_difference:.4f})"
+                )
 
             return prediction_label, confidence
         except Exception as e:
